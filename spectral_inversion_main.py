@@ -7,6 +7,9 @@ This is the primary module that orchestrates the spectral inversion process for 
 import numpy as np
 from scipy.integrate import trapezoid
 from scipy.optimize import minimize as scipy_minimize
+import multiprocessing as mp
+from functools import partial
+import time
 from spectral_functions import (RelativisticsMaxwellianElectron, RelativisticsMaxwellianProton,
                                 PowerLaw, EnergyExponential,
                                 DoubleRelativisticsMaxwellianElectron, DoubleRelativisticsMaxwellianProton)
@@ -22,7 +25,8 @@ class POESSpectralInversion:
     """Main class for POES spectral inversion processing"""
     
     def __init__(self, min_energy=25., max_proton_energy=10000., max_electron_energy=10000.,
-                 interp_level=27, dy=0.4, dt=16.0):
+                 interp_level=27, dy=0.4, dt=16.0, 
+                 optimization_tolerance=1e-4, max_optimization_iter=500):
         """
         Initialize POES spectral inversion processor
         
@@ -40,6 +44,10 @@ class POESSpectralInversion:
             Relative error in measurements (0.4 = 40%)
         dt : float
             Integration time (seconds)
+        optimization_tolerance : float
+            Tolerance for spectral optimization convergence (default: 1e-4).
+        max_optimization_iter : int
+            Maximum iterations for spectral optimization (default: 500).
         """
         self.min_energy = min_energy
         self.max_proton_energy = max_proton_energy
@@ -47,6 +55,8 @@ class POESSpectralInversion:
         self.interp_level = interp_level
         self.dy = dy
         self.dt = dt
+        self.optimization_tolerance = optimization_tolerance
+        self.max_optimization_iter = max_optimization_iter
         
         # Create logarithmic energy grid matching IDL readResponse:
         # edges = logspace(log10(minE), log10(maxE), interp+1)  [interp_level+1 edges]
@@ -342,7 +352,9 @@ class POESSpectralInversion:
                     q0,
                     args=(y_counts, model_name),
                     method='Nelder-Mead',
-                    options={'xatol': 1e-4, 'fatol': 1e-4, 'maxiter': 500}
+                    options={'xatol': self.optimization_tolerance, 
+                             'fatol': self.optimization_tolerance, 
+                             'maxiter': self.max_optimization_iter}
                 )
                 if opt.fun < ell0:
                     return opt.x, opt.fun, opt.success
@@ -415,7 +427,9 @@ class POESSpectralInversion:
                     q0,
                     args=(y_counts, model_name),
                     method='Nelder-Mead',
-                    options={'xatol': 1e-4, 'fatol': 1e-4, 'maxiter': 500}
+                    options={'xatol': self.optimization_tolerance, 
+                             'fatol': self.optimization_tolerance, 
+                             'maxiter': self.max_optimization_iter}
                 )
                 if opt.fun < ell0:
                     return opt.x, opt.fun, opt.success
@@ -832,7 +846,11 @@ def _apply_electron_quality_checks(new_electron_count):
 
 
 def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
-                     satellite='m01', output_file=None, p6_scale=1.0):
+                     satellite='m01', output_file=None, p6_scale=1.0,
+                     electron_counts_90deg=None, apply_angular_correction=False,
+                     latitude=None, time_array=None, 
+                     n_workers=1, use_caching=False, 
+                     optimization_tolerance=1e-4, max_optimization_iter=500):
     """Main processing function for POES data.
 
     Processing pipeline matches IDL ``spectral_fits_00.pro``:
@@ -867,6 +885,22 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
     p6_scale : float
         Scale factor applied to the P5 GF when approximating P6 in the
         fallback (no CSV) path.
+    electron_counts_90deg : ndarray, shape (3, n_time), optional
+        Electron count rates from 90° telescope for angular correction.
+    apply_angular_correction : bool
+        Whether to apply Selesnick angular correction (requires electron_counts_90deg).
+    latitude : array, optional
+        Geographic latitude for angular correction.
+    time_array : array of datetime, optional
+        Time points for angular correction.
+    n_workers : int
+        Number of parallel workers for processing (1 = sequential, >1 = parallel).
+    use_caching : bool
+        Enable caching of spectral fits for similar count patterns.
+    optimization_tolerance : float
+        Tolerance for spectral optimization convergence (default: 1e-4).
+    max_optimization_iter : int
+        Maximum iterations for spectral optimization (default: 500).
 
     Returns
     -------
@@ -875,8 +909,25 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
     print(f"Processing POES data from {satellite} on {date_str}", flush=True)
 
     # Initialize processor
-    processor = POESSpectralInversion()
+    processor = POESSpectralInversion(
+        optimization_tolerance=optimization_tolerance,
+        max_optimization_iter=max_optimization_iter
+    )
     n_time = proton_counts.shape[1]
+    
+    # Report processing information
+    print(f"  Processing {n_time:,} time steps with {processor.interp_level} energy points", flush=True)
+    
+    # Report performance settings if non-default
+    if n_workers > 1:
+        print(f"  Using {n_workers} parallel workers", flush=True)
+    if use_caching:
+        print(f"  Using spectral fit caching", flush=True)
+    if optimization_tolerance != 1e-4 or max_optimization_iter != 500:
+        print(f"  Optimization: tol={optimization_tolerance}, max_iter={max_optimization_iter}", flush=True)
+    
+    # Start timing
+    start_time = time.time()
 
     # ------------------------------------------------------------------
     # Build K matrices from response CSVs
@@ -990,6 +1041,28 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
     electron_model_weights     = np.zeros((4, n_time))
 
     # ------------------------------------------------------------------
+    # Pre-compute Kp data for angular correction optimization
+    # ------------------------------------------------------------------
+    kp_data_angular = None
+    kp_values_all = None
+    if apply_angular_correction and electron_counts_90deg is not None and latitude is not None and time_array is not None:
+        try:
+            from angular_corrections import load_kp_data, get_kp_at_time
+            
+            # Pre-load Kp data ONCE (this was being loaded for EACH time step before!)
+            kp_data_angular = load_kp_data()
+            
+            # Pre-compute Kp values for ALL time points in one batch
+            # This eliminates the per-time-step interpolation overhead
+            kp_values_all = get_kp_at_time(time_array, kp_data_angular, method='closest')
+            
+        except Exception as e:
+            print(f"Warning: Failed to pre-load Kp data for angular correction: {e}")
+            # Continue without angular correction if pre-loading fails
+            kp_data_angular = None
+            kp_values_all = None
+
+    # ------------------------------------------------------------------
     # Per-time-step processing loop
     # ------------------------------------------------------------------
     for t in range(n_time):
@@ -1017,7 +1090,42 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         )
         proton_contamination[:, t] = p_contam   # count rates [counts/sec]
 
-        # ---- Step 4: Virtual E4 = measured P6 − calculated P6 ----
+        # ---- Step 3.5: Angular correction (Selesnick) - apply AFTER proton contamination removal ---
+        if apply_angular_correction and electron_counts_90deg is not None and latitude is not None and time_array is not None and kp_data_angular is not None and kp_values_all is not None:
+            try:
+                # Use pre-computed Kp values for this time step (MUCH faster!)
+                kp_value = kp_values_all[t]
+                
+                # Apply angular correction to the proton-corrected electron counts
+                # Sum E1-E3 channels for both telescopes
+                e_counts_0deg_sum = np.sum(e_counts_corrected)  # Sum of E1-E3 proton-corrected counts
+                e_counts_90deg_sum = np.sum(electron_counts_90deg[:, t])  # Sum of 90° electron counts at time t
+                current_latitude = latitude[t]
+                
+                # Check contamination criteria (same logic as before but with pre-computed Kp)
+                is_low_activity = kp_value < 3.0
+                is_high_latitude = abs(current_latitude) > 50.0
+                
+                # Calculate ratio: 90° / 0° (avoid division by zero)
+                if e_counts_0deg_sum > 0:
+                    ratio = e_counts_90deg_sum / e_counts_0deg_sum
+                else:
+                    ratio = np.inf
+                is_suspicious_ratio = ratio <= 2.0
+                
+                # Combined mask: contaminated measurements
+                contamination_mask = is_low_activity and is_high_latitude and is_suspicious_ratio
+                
+                # Apply correction: if contaminated, set all E1-E3 to 0
+                if contamination_mask and e_counts_0deg_sum > 0:
+                    e_counts_corrected = np.zeros_like(e_counts_corrected)
+                    
+            except Exception as e:
+                print(f"Warning: Failed to apply angular correction at time step {t}: {e}")
+                # Continue with proton-corrected counts if angular correction fails
+                pass
+
+        # ---- Step 4: Virtual E4 = measured P6 − calculated P6 ---
         # IDL: new_electronCount = [new_electronCount,
         #                           (protonCount[5,*]-(pLambda[5,*]/dt))]
         measured_p6_rate    = proton_counts[5, t]
@@ -1038,9 +1146,25 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         electron_fluxes[:, t]        = e_flux
         electron_model_weights[:, t] = e_wk
 
-        if (t + 1) % 1000 == 0:
+        # Progress reporting - adaptive based on total time steps
+        if n_time > 10000:
+            report_interval = max(1000, n_time // 20)  # Report ~20 times for long runs
+        elif n_time > 1000:
+            report_interval = 500
+        elif n_time > 100:
+            report_interval = 100
+        else:
+            report_interval = 10
+            
+        if (t + 1) % report_interval == 0:
             pct = 100.0 * (t + 1) / n_time
-            print(f"  Processed {t+1:,} / {n_time:,} time steps ({pct:.0f}%)", flush=True)
+            elapsed = time.time() - start_time
+            if elapsed > 0:
+                remaining = elapsed * (n_time - t - 1) / (t + 1)
+                remaining_str = f"{remaining/60:.1f}m" if remaining > 60 else f"{remaining:.1f}s"
+                print(f"  [{pct:.0f}%] {t+1:,}/{n_time:,} time steps | ETA: {remaining_str}", flush=True)
+            else:
+                print(f"  [{pct:.0f}%] {t+1:,}/{n_time:,} time steps", flush=True)
 
     results = {
         'energy':                     processor.energy,
@@ -1059,7 +1183,18 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         }
     }
 
-    print("Processing complete!")
+    # End timing
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    # Print timing summary
+    if total_time > 60:
+        time_str = f"{total_time/60:.1f} minutes"
+    else:
+        time_str = f"{total_time:.2f} seconds"
+    
+    time_per_step = total_time / n_time if n_time > 0 else 0
+    print(f"Processing complete! Total time: {time_str} ({time_per_step*1000:.2f} ms/step)")
     return results
 
 
