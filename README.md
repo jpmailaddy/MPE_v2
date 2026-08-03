@@ -173,30 +173,8 @@ corrected_counts = angular_corr.apply_correction(
 ### Input Files
 
 The software expects POES MEPED data in either:
-- NetCDF format (preferred)
-- CDF format (legacy)
-
-Input files should contain:
-- Count rates for electron and proton channels
-- Time stamps
-- Geographic and geomagnetic coordinates
-- Pitch angles
-- L-values
-
-### Required Channels
-
-**Proton Channels (P1-P5):**
-- P1: ~39 keV
-- P2: ~115 keV
-- P3: ~332 keV
-- P4: ~1105 keV
-- P5: ~2723 keV
-
-**Electron Channels (E1-E4):**
-- E1: ~72 keV
-- E2: ~193 keV
-- E3: ~419 keV
-- E4: ~879 keV
+- NetCDF format (https://www.ncei.noaa.gov/products/poes-metop-space-environment-monitor) - Requires both the raw level 1a and processed level 1b data
+- CDF format (still updating)
 
 ### Kp Index Data
 
@@ -336,11 +314,7 @@ For detailed debugging information, modify the logging level in the main process
 
 If you use this software in your research, please cite:
 
-- Selesnick, R. S., Baker, D. N., Jaynes, A. N., et al. (2020). POES/MEPED Angular Response Functions and the Precipitating Radiation Belt Electron Flux. Journal of Geophysical Research: Space Physics, 125(4), e2019JA027414.
-
-## License
-
-This software is provided for research purposes. Contact the authors for licensing information.
+Pettit, J. M., Randall, C. E., Peck, E. D., & Harvey, V. L. (2021). A new MEPED-based precipitating electron data set. Journal of Geophysical Research: Space Physics, 126, e2021JA029667. https://doi.org/10.1029/2021JA029667
 
 ## Contributing
 
@@ -352,8 +326,8 @@ Contributions are welcome. Please open an issue or submit a pull request for:
 
 ## Support
 
-For questions or issues, please contact the development team or open an issue on GitHub.
+joshua.pettit at helsinki.fi
 
 ---
 
-**Acknowledgments:** This software was developed at NASA GSFC in collaboration with George Mason University, based on the original IDL implementation by R. Selesnick.
+**Acknowledgments:** This software was developed originally at the Laboratory of Atmospheric and Space Physics at the University of Colorado and updated at NASA GSFC in collaboration with George Mason University, based on the original IDL implementation by J. Pettit
