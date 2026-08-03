@@ -355,38 +355,85 @@ class POESRawDataReader:
         self.ds_raw = nc.Dataset(raw_file, 'r')
         self.ds_proc = nc.Dataset(proc_file, 'r')
     
-    def read_electron_counts(self):
+    def read_electron_counts(self, telescope='0deg'):
         """
-        Read electron count channels (E1, E2, E3)
+        Read electron count channels (E1, E2, E3) for specified telescope
+        
+        Parameters
+        ----------
+        telescope : str
+            Telescope orientation: '0deg' (default) or '90deg'
         
         Returns
         -------
         electron_counts : ndarray, shape (3, n_time)
             Electron counts for channels E1, E2, E3
         """
-        e1 = self.ds_raw.variables['mep_ele_tel0_cps_e1'][:]
-        e2 = self.ds_raw.variables['mep_ele_tel0_cps_e2'][:]
-        e3 = self.ds_raw.variables['mep_ele_tel0_cps_e3'][:]
+        if telescope == '0deg':
+            e1 = self.ds_raw.variables['mep_ele_tel0_cps_e1'][:]
+            e2 = self.ds_raw.variables['mep_ele_tel0_cps_e2'][:]
+            e3 = self.ds_raw.variables['mep_ele_tel0_cps_e3'][:]
+        elif telescope == '90deg':
+            e1 = self.ds_raw.variables['mep_ele_tel90_cps_e1'][:]
+            e2 = self.ds_raw.variables['mep_ele_tel90_cps_e2'][:]
+            e3 = self.ds_raw.variables['mep_ele_tel90_cps_e3'][:]
+        else:
+            raise ValueError(f"Unknown telescope: {telescope}. Use '0deg' or '90deg'.")
         
         return np.array([e1, e2, e3])
     
-    def read_proton_counts(self):
+    def read_proton_counts(self, telescope='0deg'):
         """
-        Read proton count channels (P1-P6)
+        Read proton count channels (P1-P6) for specified telescope
+        
+        Parameters
+        ----------
+        telescope : str
+            Telescope orientation: '0deg' (default) or '90deg'
         
         Returns
         -------
         proton_counts : ndarray, shape (6, n_time)
             Proton counts for channels P1, P2, P3, P4, P5, P6
         """
-        p1 = self.ds_raw.variables['mep_pro_tel0_cps_p1'][:]
-        p2 = self.ds_raw.variables['mep_pro_tel0_cps_p2'][:]
-        p3 = self.ds_raw.variables['mep_pro_tel0_cps_p3'][:]
-        p4 = self.ds_raw.variables['mep_pro_tel0_cps_p4'][:]
-        p5 = self.ds_raw.variables['mep_pro_tel0_cps_p5'][:]
-        p6 = self.ds_raw.variables['mep_pro_tel0_cps_p6'][:]
+        if telescope == '0deg':
+            p1 = self.ds_raw.variables['mep_pro_tel0_cps_p1'][:]
+            p2 = self.ds_raw.variables['mep_pro_tel0_cps_p2'][:]
+            p3 = self.ds_raw.variables['mep_pro_tel0_cps_p3'][:]
+            p4 = self.ds_raw.variables['mep_pro_tel0_cps_p4'][:]
+            p5 = self.ds_raw.variables['mep_pro_tel0_cps_p5'][:]
+            p6 = self.ds_raw.variables['mep_pro_tel0_cps_p6'][:]
+        elif telescope == '90deg':
+            p1 = self.ds_raw.variables['mep_pro_tel90_cps_p1'][:]
+            p2 = self.ds_raw.variables['mep_pro_tel90_cps_p2'][:]
+            p3 = self.ds_raw.variables['mep_pro_tel90_cps_p3'][:]
+            p4 = self.ds_raw.variables['mep_pro_tel90_cps_p4'][:]
+            p5 = self.ds_raw.variables['mep_pro_tel90_cps_p5'][:]
+            p6 = self.ds_raw.variables['mep_pro_tel90_cps_p6'][:]
+        else:
+            raise ValueError(f"Unknown telescope: {telescope}. Use '0deg' or '90deg'.")
         
         return np.array([p1, p2, p3, p4, p5, p6])
+    
+    def read_all_telescope_counts(self):
+        """
+        Read counts from both 0° and 90° telescopes for Selesnick correction
+        
+        Returns
+        -------
+        dict
+            Dictionary with:
+            - 'electron_0deg': ndarray, shape (3, n_time) - 0° electron counts (E1-E3)
+            - 'electron_90deg': ndarray, shape (3, n_time) - 90° electron counts (E1-E3)
+            - 'proton_0deg': ndarray, shape (6, n_time) - 0° proton counts (P1-P6)
+            - 'proton_90deg': ndarray, shape (6, n_time) - 90° proton counts (P1-P6)
+        """
+        return {
+            'electron_0deg': self.read_electron_counts('0deg'),
+            'electron_90deg': self.read_electron_counts('90deg'),
+            'proton_0deg': self.read_proton_counts('0deg'),
+            'proton_90deg': self.read_proton_counts('90deg')
+        }
     
     def read_time(self):
         """
