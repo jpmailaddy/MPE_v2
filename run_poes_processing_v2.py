@@ -6,8 +6,11 @@ Author: Joshua Pettit, GMU/NASA GSFC
 Features:
 - Single file processing with date/satellite specification
 - Bulk directory processing with automatic file detection
-- Resolution options: 2-second (raw), 16-second (averaged), or auto-detect
+- Resolution options: 2-second (raw), 16-second (averaged)
 - Progress reporting for long-running jobs
+- Multi-telescope support: 00deg, 90deg, or both
+- Selesnick angular correction (enabled by default when both telescopes are analyzed)
+- Performance optimization options for faster processing
 
 Usage Examples:
     # Single date processing
@@ -21,6 +24,24 @@ Usage Examples:
     
     # Using full file paths
     python3 run_poes_processing_v2.py --raw-file /path/poes_n15_20140101_raw.nc --proc-file /path/poes_n15_20140101_proc.nc --date 2014-01-01
+    
+    # Process only 0-degree telescope
+    python3 run_poes_processing_v2.py --directory /path/to/data --satellite n15 --telescope 00deg
+    
+    # Process only 90-degree telescope  
+    python3 run_poes_processing_v2.py --directory /path/to/data --satellite n15 --telescope 90deg
+    
+    # Process both telescopes with angular correction (default)
+    python3 run_poes_processing_v2.py --directory /path/to/data --satellite n15 --telescope both
+    
+    # Process both telescopes without angular correction
+    python3 run_poes_processing_v2.py --directory /path/to/data --satellite n15 --telescope both --no-angular-correction
+    
+    # Fast processing mode (2-3x faster)
+    python3 run_poes_processing_v2.py --directory /path/to/data --satellite n15 --fast
+    
+    # Custom optimization parameters
+    python3 run_poes_processing_v2.py --directory /path/to/data --satellite n15 --optimization-tolerance 1e-3 --max-optimization-iter 200
     
     # Default (sample files)
     python3 run_poes_processing_v2.py
@@ -74,7 +95,9 @@ def detect_resolution(raw_file):
         return '16sec'
 
 
-def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, resolution='auto'):
+def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, resolution='auto',
+                       telescope='both', apply_angular_correction=None,
+                       fast_mode=False, optimization_tolerance=1e-4, max_optimization_iter=500):
     """
     Process a single pair of POES files
     
@@ -92,6 +115,17 @@ def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, re
         Date string (YYYY-MM-DD)
     resolution : str
         'auto', '2sec', or '16sec'
+    telescope : str
+        '00deg', '90deg', or 'both' (default)
+    apply_angular_correction : bool or None
+        None (default) = auto-enable when telescope='both'
+        True = force enable, False = force disable
+    fast_mode : bool
+        Enable fast mode with reduced optimization parameters
+    optimization_tolerance : float
+        Optimization tolerance for spectral fitting
+    max_optimization_iter : int
+        Maximum iterations for spectral fitting
     
     Returns
     -------
@@ -99,7 +133,20 @@ def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, re
         True if successful, False otherwise
     """
     
-    print(f"\n[Processing] {satellite.upper()} - {date_str}")
+    # Determine if we should apply angular correction
+    if apply_angular_correction is None:
+        apply_angular_correction = (telescope == 'both')
+    
+    # Validate angular correction usage
+    if apply_angular_correction and telescope != 'both':
+        print(f"\n❌ ERROR: Angular correction requires telescope='both', but got '{telescope}'")
+        return False
+    
+    print(f"\n[Processing] {satellite.upper()} - {date_str} - Telescope: {telescope}")
+    if apply_angular_correction:
+        print("  [Angular Correction] ENABLED")
+    else:
+        print("  [Angular Correction] DISABLED")
     print("-" * 80)
     
     # Verify input files exist
@@ -120,56 +167,141 @@ def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, re
         print(f"  Auto-detected resolution: {resolution}")
     
     try:
-        # Read raw data
+        # Read data based on telescope selection
         with POESRawDataReader(raw_file, proc_file) as reader:
             
-            # Read all raw data
-            all_data = reader.read_all_data()
-            
-            n_time_raw = all_data['electron_counts'].shape[1]
-            print(f"  ✅ Read {n_time_raw:,} time points (raw resolution)")
-            
-            # Handle resolution
+            # Handle resolution first
             if resolution == '16sec':
                 # Average to 16-second resolution
                 print(f"  Averaging to 16-second resolution...")
-                avg_data = reader.average_to_16sec()
-                proton_counts = avg_data['proton_counts']
-                electron_counts = avg_data['electron_counts']
-                time = avg_data['time']
-                rtime = avg_data['rtime']
-                mlt = avg_data['mlt']
-                l_value = avg_data['l_value']
-                pitch_angle = avg_data['pitch_angle']
-                b_sat = avg_data['b_sat']
-                b_foot = avg_data['b_foot']
-                blc_angle = avg_data['blc_angle']
-                geog_lat = avg_data['geog_lat']
-                geog_lon = avg_data['geog_lon']
-                fofl_lat = avg_data['fofl_lat']
-                fofl_lon = avg_data['fofl_lon']
-                resolution_label = "16-second"
                 
+                if telescope == 'both':
+                    # For both telescopes with 16sec resolution, we need to read and average telescope counts
+                    # Angular correction will be applied INSIDE process_poes_data AFTER proton contamination removal
+                    try:
+                        # Read raw telescope data (2-second resolution)
+                        all_telescope_counts = reader.read_all_telescope_counts()
+                        
+                        # Manually average telescope data to 16-second resolution
+                        n_samples = all_telescope_counts['electron_0deg'].shape[1]
+                        n_bins = n_samples // 8
+                        n_samples_trimmed = n_bins * 8
+                        
+                        # Average electron counts for both telescopes
+                        electron_0deg_avg = np.array([
+                            all_telescope_counts['electron_0deg'][i, :n_samples_trimmed].reshape(n_bins, 8).mean(axis=1)
+                            for i in range(3)
+                        ])
+                        electron_90deg_avg = np.array([
+                            all_telescope_counts['electron_90deg'][i, :n_samples_trimmed].reshape(n_bins, 8).mean(axis=1)
+                            for i in range(3)
+                        ])
+                        proton_0deg_avg = np.array([
+                            all_telescope_counts['proton_0deg'][i, :n_samples_trimmed].reshape(n_bins, 8).mean(axis=1)
+                            for i in range(6)
+                        ])
+                        
+                        # Use averaged telescope data
+                        electron_counts = electron_0deg_avg
+                        electron_counts_90deg = electron_90deg_avg
+                        proton_counts = proton_0deg_avg
+                        
+                        # Also need to average the other data from avg_data
+                        avg_data = reader.average_to_16sec()
+                        time = avg_data['time']
+                        rtime = avg_data['rtime']
+                        mlt = avg_data['mlt']
+                        l_value = avg_data['l_value']
+                        pitch_angle = avg_data['pitch_angle']
+                        b_sat = avg_data['b_sat']
+                        b_foot = avg_data['b_foot']
+                        geog_lat = avg_data['geog_lat']
+                        geog_lon = avg_data['geog_lon']
+                        fofl_lat = avg_data['fofl_lat']
+                        fofl_lon = avg_data['fofl_lon']
+                        blc_angle = avg_data['blc_angle']
+                        
+                        resolution_label = "16-second"
+                        
+                    except Exception as e:
+                        print(f"  ❌ ERROR preparing data for both telescopes at 16sec: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return False
+                else:
+                    # Single telescope at 16sec resolution
+                    avg_data = reader.average_to_16sec()
+                    proton_counts = avg_data['proton_counts']
+                    electron_counts = avg_data['electron_counts']
+                    time = avg_data['time']
+                    rtime = avg_data['rtime']
+                    mlt = avg_data['mlt']
+                    l_value = avg_data['l_value']
+                    pitch_angle = avg_data['pitch_angle']
+                    b_sat = avg_data['b_sat']
+                    b_foot = avg_data['b_foot']
+                    geog_lat = avg_data['geog_lat']
+                    geog_lon = avg_data['geog_lon']
+                    fofl_lat = avg_data['fofl_lat']
+                    fofl_lon = avg_data['fofl_lon']
+                    blc_angle = avg_data['blc_angle']
+                    resolution_label = "16-second"
+            
             elif resolution == '2sec':
                 # Use raw data without averaging
                 print(f"  Using raw 2-second resolution...")
-                proton_counts = all_data['proton_counts']
-                electron_counts = all_data['electron_counts']
-                time = all_data['time']
-                rtime = all_data['rtime']
-                mlt = all_data['mlt']
-                l_value = all_data['l_value']
-                pitch_angle = all_data['pitch_angle']
-                b_sat = all_data['b_sat']
-                b_foot = all_data['b_foot']
-                geog_lat = all_data['geog_lat']
-                geog_lon = all_data['geog_lon']
-                fofl_lat = all_data['fofl_lat']
-                fofl_lon = all_data['fofl_lon']
-                # Compute BLC angle for 2-second data
-                blc_angle = reader._compute_blc_angle(pitch_angle, b_sat, b_foot)
-                resolution_label = "2-second"
-            
+                
+                if telescope == 'both':
+                    # For both telescopes, we need to read all telescope counts
+                    # Angular correction will be applied INSIDE process_poes_data AFTER proton contamination removal
+                    try:
+                        all_telescope_counts = reader.read_all_telescope_counts()
+                        all_data = reader.read_all_data()
+                        
+                        time = all_data['time']
+                        rtime = all_data['rtime']
+                        mlt = all_data['mlt']
+                        l_value = all_data['l_value']
+                        pitch_angle = all_data['pitch_angle']
+                        b_sat = all_data['b_sat']
+                        b_foot = all_data['b_foot']
+                        geog_lat = all_data['geog_lat']
+                        geog_lon = all_data['geog_lon']
+                        fofl_lat = all_data['fofl_lat']
+                        fofl_lon = all_data['fofl_lon']
+                        blc_angle = reader._compute_blc_angle(pitch_angle, b_sat, b_foot)
+                        
+                        # Use raw 0° electron data and 90° data, proton data from 0°
+                        # Angular correction will be applied inside process_poes_data if enabled
+                        electron_counts = all_telescope_counts['electron_0deg']
+                        electron_counts_90deg = all_telescope_counts['electron_90deg']
+                        proton_counts = all_telescope_counts['proton_0deg']
+                        
+                        resolution_label = "2-second"
+                        
+                    except Exception as e:
+                        print(f"  ❌ ERROR preparing data for both telescopes: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return False
+                else:
+                    # Single telescope
+                    all_data = reader.read_all_data()
+                    proton_counts = all_data['proton_counts']
+                    electron_counts = all_data['electron_counts']
+                    time = all_data['time']
+                    rtime = all_data['rtime']
+                    mlt = all_data['mlt']
+                    l_value = all_data['l_value']
+                    pitch_angle = all_data['pitch_angle']
+                    b_sat = all_data['b_sat']
+                    b_foot = all_data['b_foot']
+                    geog_lat = all_data['geog_lat']
+                    geog_lon = all_data['geog_lon']
+                    fofl_lat = all_data['fofl_lat']
+                    fofl_lon = all_data['fofl_lon']
+                    blc_angle = reader._compute_blc_angle(pitch_angle, b_sat, b_foot)
+                    resolution_label = "2-second"
             else:
                 print(f"  ❌ Unknown resolution: {resolution}")
                 return False
@@ -184,12 +316,39 @@ def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, re
     # Process data (spectral fitting)
     print(f"  Processing data through spectral inversion...")
     try:
-        results = process_poes_data(
-            proton_counts=proton_counts,
-            electron_counts=electron_counts,
-            date_str=date_str,
-            satellite=satellite
-        )
+        # Pass angular correction parameters if available
+        kwargs = {
+            'proton_counts': proton_counts,
+            'electron_counts': electron_counts,
+            'date_str': date_str,
+            'satellite': satellite
+        }
+        
+        # Add performance optimization parameters
+        # If fast_mode is True, use aggressive optimization settings
+        final_optimization_tolerance = 1e-3 if fast_mode else optimization_tolerance
+        final_max_optimization_iter = 200 if fast_mode else max_optimization_iter
+        
+        kwargs.update({
+            'optimization_tolerance': final_optimization_tolerance,
+            'max_optimization_iter': final_max_optimization_iter
+        })
+        
+        # Add angular correction parameters if we have both telescopes
+        if apply_angular_correction and 'electron_counts_90deg' in locals():
+            import pandas as pd
+            from datetime import datetime
+            time_datetime = pd.to_datetime(time, unit='ms')
+            # Convert pandas Timestamp to datetime objects
+            time_array_for_angular = [ts.to_pydatetime() for ts in time_datetime]
+            kwargs.update({
+                'electron_counts_90deg': electron_counts_90deg,
+                'apply_angular_correction': True,
+                'latitude': geog_lat,
+                'time_array': time_array_for_angular
+            })
+        
+        results = process_poes_data(**kwargs)
         
         print(f"  ✅ Spectral fitting complete!")
     
@@ -201,9 +360,12 @@ def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, re
     try:
         # Create output filename with resolution indicator
         res_str = '16s' if '16sec' in resolution else '2s'
+        # Add telescope suffix to output filename
+        telescope_suffix = f'_{telescope}' if telescope != 'both' else '_both'
+        
         output_file = os.path.join(
             output_dir, 
-            f'POES_flux_{satellite}_{date_str.replace("-", "")}_{res_str}.nc'
+            f'POES_flux_{satellite}_{date_str.replace("-", "")}_{res_str}{telescope_suffix}.nc'
         )
         
         writer = NetCDFWriter(output_file)
@@ -257,7 +419,9 @@ def process_single_file(raw_file, proc_file, output_dir, satellite, date_str, re
         return False
 
 
-def process_directory(directory, satellite, output_dir=None, resolution='auto'):
+def process_directory(directory, satellite, output_dir=None, resolution='auto',
+                     telescope='both', no_angular_correction=False,
+                     fast_mode=False, optimization_tolerance=1e-4, max_optimization_iter=500):
     """
     Process all POES files in a directory
     
@@ -271,6 +435,16 @@ def process_directory(directory, satellite, output_dir=None, resolution='auto'):
         Output directory (defaults to input directory)
     resolution : str
         'auto', '2sec', or '16sec'
+    telescope : str
+        '00deg', '90deg', or 'both' (default)
+    no_angular_correction : bool
+        Whether to disable angular correction (default: False)
+    fast_mode : bool
+        Enable fast mode with reduced optimization parameters
+    optimization_tolerance : float
+        Optimization tolerance for spectral fitting
+    max_optimization_iter : int
+        Maximum iterations for spectral fitting
     
     Returns
     -------
@@ -337,7 +511,12 @@ def process_directory(directory, satellite, output_dir=None, resolution='auto'):
             output_dir=output_dir,
             satellite=sat_code,
             date_str=date_str,
-            resolution=resolution
+            resolution=resolution,
+            telescope=telescope,
+            apply_angular_correction=not no_angular_correction,
+            fast_mode=fast_mode,
+            optimization_tolerance=optimization_tolerance,
+            max_optimization_iter=max_optimization_iter
         )
         
         if success:
@@ -409,6 +588,21 @@ Note: Resolution auto-detection uses year (pre-2012: 16sec, post-2012: 2sec)
     parser.add_argument('--proc-file', type=str, default=None,
                        help='Full path to proc.nc file')
     
+    # Telescope selection and angular correction
+    parser.add_argument('--telescope', type=str, choices=['00deg', '90deg', 'both'],
+                       default='both',
+                       help='Which telescope(s) to process: 00deg, 90deg, or both (default)')
+    parser.add_argument('--no-angular-correction', action='store_true', default=False,
+                       help='Disable Selesnick angular correction (only applicable when telescope=both)')
+    
+    # Performance optimization arguments
+    parser.add_argument('--fast', action='store_true', default=False,
+                       help='Enable fast mode: reduces optimization iterations and tolerance for 2-3x speedup')
+    parser.add_argument('--optimization-tolerance', type=float, default=1e-4,
+                       help='Optimization tolerance (default: 1e-4, use 1e-3 for faster but less precise results)')
+    parser.add_argument('--max-optimization-iter', type=int, default=500,
+                       help='Maximum optimization iterations (default: 500, reduce to 200-300 for faster processing)')
+    
     args = parser.parse_args()
     
     # Determine processing mode
@@ -424,7 +618,12 @@ Note: Resolution auto-detection uses year (pre-2012: 16sec, post-2012: 2sec)
             output_dir=output_dir,
             satellite=args.satellite,
             date_str=date_str,
-            resolution=args.resolution
+            telescope=args.telescope,
+            apply_angular_correction=not args.no_angular_correction,
+            resolution=args.resolution,
+            fast_mode=args.fast,
+            optimization_tolerance=args.optimization_tolerance,
+            max_optimization_iter=args.max_optimization_iter
         )
         return success
 
@@ -434,7 +633,12 @@ Note: Resolution auto-detection uses year (pre-2012: 16sec, post-2012: 2sec)
             directory=args.directory,
             satellite=args.satellite,
             output_dir=args.output,
-            resolution=args.resolution
+            resolution=args.resolution,
+            telescope=args.telescope,
+            no_angular_correction=args.no_angular_correction,
+            fast_mode=args.fast,
+            optimization_tolerance=args.optimization_tolerance,
+            max_optimization_iter=args.max_optimization_iter
         )
         return stats['successful'] == stats['total']
     
@@ -454,7 +658,12 @@ Note: Resolution auto-detection uses year (pre-2012: 16sec, post-2012: 2sec)
             output_dir=data_dir,
             satellite=args.satellite,
             date_str=date_str,
-            resolution=args.resolution
+            resolution=args.resolution,
+            telescope=args.telescope,
+            apply_angular_correction=not args.no_angular_correction,
+            fast_mode=args.fast,
+            optimization_tolerance=args.optimization_tolerance,
+            max_optimization_iter=args.max_optimization_iter
         )
         return success
 
@@ -478,7 +687,12 @@ Note: Resolution auto-detection uses year (pre-2012: 16sec, post-2012: 2sec)
             output_dir=output_dir,
             satellite=satellite,
             date_str=date_str,
-            resolution=resolution
+            resolution=resolution,
+            telescope='both',  # Default for sample files
+            apply_angular_correction=True,
+            fast_mode=False,  # Use default optimization for sample files
+            optimization_tolerance=1e-4,
+            max_optimization_iter=500
         )
         return success
 
