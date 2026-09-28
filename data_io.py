@@ -172,6 +172,13 @@ class NetCDFWriter:
         corrected_eocounts.setncattr('Description', 'Electron count rates after proton contamination removal, includes virtual E4 derived from P6')
         corrected_eocounts.setncattr('Bad_Data_Value', -999.0)
         
+        # E4 correction flag
+        e4_correction_flag = self.ds.createVariable('E4_correction_flag', 'i1', ('time',))
+        e4_correction_flag.setncattr('Full_Name', 'E4 Correction Flag')
+        e4_correction_flag.setncattr('Units', ' ')
+        e4_correction_flag.setncattr('Description', 'Flag indicating when E4 channel has been set to E3 to prevent unphysical spectra (1 = corrected, 0 = not corrected)')
+        e4_correction_flag.setncattr('Bad_Data_Value', -999)
+        
         # Spectral parameters
         ermq = self.ds.createVariable('ERMq', 'f8', ('2_Parameter_Spectrum', 'time'))
         ermq.setncattr('Full_Name', 'Parameters for Electron Relativistic Maxwellian Spectrum')
@@ -215,6 +222,7 @@ class NetCDFWriter:
             'fofl_lat': 'foflLat', 'fofl_lon': 'foflLon',
             'mlt': 'MLT', 'lvalue': 'lValue', 'pitch': 'pitch',
             'bfofl': 'Bfofl', 'blocal': 'Blocal', 'blc_angle': 'BLC_Angle',
+            'e4_correction_flag': 'E4_correction_flag',
             'electron_flux': 'Ecounts', 'proton_flux': 'Pcounts',
             'electron_counts': 'EOcounts', 'proton_counts': 'POcounts',
             'proton_contamination': 'ProtonContamination',
@@ -255,6 +263,7 @@ class NetCDFWriter:
             'fofl_lat': 'foflLat', 'fofl_lon': 'foflLon',
             'mlt': 'MLT', 'lvalue': 'lValue', 'pitch': 'pitch',
             'bfofl': 'Bfofl', 'blocal': 'Blocal', 'blc_angle': 'BLC_Angle',
+            'e4_correction_flag': 'E4_correction_flag',
         }
         array_vars = {
             'electron_flux': 'Ecounts', 'proton_flux': 'Pcounts',
@@ -362,23 +371,24 @@ class POESRawDataReader:
         Parameters
         ----------
         telescope : str
-            Telescope orientation: '0deg' (default) or '90deg'
+            Telescope orientation: '0deg', '00deg' (default) or '90deg'
         
         Returns
         -------
         electron_counts : ndarray, shape (3, n_time)
             Electron counts for channels E1, E2, E3
         """
-        if telescope == '0deg':
+        # Support both '0deg'/'90deg' and '00deg'/'90deg' formats
+        if telescope in ['0deg', '00deg']:
             e1 = self.ds_raw.variables['mep_ele_tel0_cps_e1'][:]
             e2 = self.ds_raw.variables['mep_ele_tel0_cps_e2'][:]
             e3 = self.ds_raw.variables['mep_ele_tel0_cps_e3'][:]
-        elif telescope == '90deg':
+        elif telescope in ['90deg']:
             e1 = self.ds_raw.variables['mep_ele_tel90_cps_e1'][:]
             e2 = self.ds_raw.variables['mep_ele_tel90_cps_e2'][:]
             e3 = self.ds_raw.variables['mep_ele_tel90_cps_e3'][:]
         else:
-            raise ValueError(f"Unknown telescope: {telescope}. Use '0deg' or '90deg'.")
+            raise ValueError(f"Unknown telescope: {telescope}. Use '0deg', '00deg', or '90deg'.")
         
         return np.array([e1, e2, e3])
     
@@ -389,21 +399,22 @@ class POESRawDataReader:
         Parameters
         ----------
         telescope : str
-            Telescope orientation: '0deg' (default) or '90deg'
+            Telescope orientation: '0deg', '00deg' (default) or '90deg'
         
         Returns
         -------
         proton_counts : ndarray, shape (6, n_time)
             Proton counts for channels P1, P2, P3, P4, P5, P6
         """
-        if telescope == '0deg':
+        # Support both '0deg'/'90deg' and '00deg'/'90deg' formats
+        if telescope in ['0deg', '00deg']:
             p1 = self.ds_raw.variables['mep_pro_tel0_cps_p1'][:]
             p2 = self.ds_raw.variables['mep_pro_tel0_cps_p2'][:]
             p3 = self.ds_raw.variables['mep_pro_tel0_cps_p3'][:]
             p4 = self.ds_raw.variables['mep_pro_tel0_cps_p4'][:]
             p5 = self.ds_raw.variables['mep_pro_tel0_cps_p5'][:]
             p6 = self.ds_raw.variables['mep_pro_tel0_cps_p6'][:]
-        elif telescope == '90deg':
+        elif telescope in ['90deg']:
             p1 = self.ds_raw.variables['mep_pro_tel90_cps_p1'][:]
             p2 = self.ds_raw.variables['mep_pro_tel90_cps_p2'][:]
             p3 = self.ds_raw.variables['mep_pro_tel90_cps_p3'][:]
@@ -411,7 +422,7 @@ class POESRawDataReader:
             p5 = self.ds_raw.variables['mep_pro_tel90_cps_p5'][:]
             p6 = self.ds_raw.variables['mep_pro_tel90_cps_p6'][:]
         else:
-            raise ValueError(f"Unknown telescope: {telescope}. Use '0deg' or '90deg'.")
+            raise ValueError(f"Unknown telescope: {telescope}. Use '0deg', '00deg', or '90deg'.")
         
         return np.array([p1, p2, p3, p4, p5, p6])
     
@@ -542,7 +553,13 @@ class POESRawDataReader:
         pitch_angle : ndarray
             Pitch angle (degrees, 0-180)
         """
-        return self.ds_proc.variables['meped_alpha_0_sat'][:]
+        pitch_angle = self.ds_proc.variables['meped_alpha_0_sat'][:]
+        
+        # Extract underlying data from masked arrays, if present
+        if isinstance(pitch_angle, np.ma.MaskedArray):
+            pitch_angle = pitch_angle.data
+            
+        return pitch_angle
     
     def read_magnetic_field(self):
         """
@@ -558,6 +575,14 @@ class POESRawDataReader:
         b_sat = self.ds_proc.variables['Btot_sat'][:]
         b_foot = self.ds_proc.variables['Btot_foot'][:]
         
+        # Extract underlying data from masked arrays, if present
+        # The masked arrays in NetCDF files often contain valid data that was
+        # masked due to quality flags. The IDL code used the raw values.
+        if isinstance(b_sat, np.ma.MaskedArray):
+            b_sat = b_sat.data
+        if isinstance(b_foot, np.ma.MaskedArray):
+            b_foot = b_foot.data
+        
         return b_sat, b_foot
     
     def read_quality_flag(self):
@@ -571,10 +596,15 @@ class POESRawDataReader:
         """
         return self.ds_proc.variables['mep_IFC_on'][:]
     
-    def read_all_data(self):
+    def read_all_data(self, telescope='0deg'):
         """
         Read all data at once
         
+        Parameters
+        ----------
+        telescope : str
+            Telescope orientation: '0deg' or '90deg' (default: '0deg')
+            
         Returns
         -------
         dict
@@ -606,8 +636,8 @@ class POESRawDataReader:
         rtime_data = calculate_rtime(time_data, year_data, day_data)
         
         return {
-            'electron_counts': self.read_electron_counts(),
-            'proton_counts': self.read_proton_counts(),
+            'electron_counts': self.read_electron_counts(telescope=telescope),
+            'proton_counts': self.read_proton_counts(telescope=telescope),
             'time': time_data,
             'rtime': rtime_data,
             'year': year_data,
@@ -696,7 +726,7 @@ class POESRawDataReader:
                 avg[i] = 0.0
         return avg
 
-    def average_to_16sec(self):
+    def average_to_16sec(self, telescope='0deg'):
         """
         Average 2-second data to 16-second resolution (matching IDL code)
         
@@ -706,12 +736,17 @@ class POESRawDataReader:
         For magnetic field data (b_sat, b_foot), masked/NaN values are automatically
         ignored during nanmean averaging. 
         
+        Parameters
+        ----------
+        telescope : str
+            Telescope orientation: '0deg' or '90deg' (default: '0deg')
+            
         Returns
         -------
         dict
             Dictionary with averaged data arrays
         """
-        all_data = self.read_all_data()
+        all_data = self.read_all_data(telescope=telescope)
         
         n_samples = all_data['electron_counts'].shape[1]
         # Calculate number of 16-second bins (factor of 8 averaging)
@@ -733,14 +768,14 @@ class POESRawDataReader:
         b_sat_trimmed = all_data['b_sat'][:n_samples_trimmed]
         b_foot_trimmed = all_data['b_foot'][:n_samples_trimmed]
         
-        # Convert masked arrays to regular arrays with NaN for masked values
+        # Convert masked arrays to regular arrays using underlying data
         # This must be done BEFORE averaging to preserve data
         if isinstance(b_sat_trimmed, np.ma.MaskedArray):
-            b_sat_trimmed = b_sat_trimmed.filled(np.nan)
+            b_sat_trimmed = b_sat_trimmed.data
         if isinstance(b_foot_trimmed, np.ma.MaskedArray):
-            b_foot_trimmed = b_foot_trimmed.filled(np.nan)
+            b_foot_trimmed = b_foot_trimmed.data
         if isinstance(pitch_trimmed, np.ma.MaskedArray):
-            pitch_trimmed = pitch_trimmed.filled(np.nan)
+            pitch_trimmed = pitch_trimmed.data
         
         # Reshape to (n_channels, n_bins, 8) and average over the 8 samples
         e_counts_avg = np.array([
