@@ -291,7 +291,8 @@ class AngularCorrection:
         Returns
         -------
         corrected_electron_counts_0deg : array
-            0° electron counts with contaminated values set to 0
+            0° electron counts with linear scaling correction applied to contaminated values
+            (full correction when ratio <= 1.0, no correction when ratio >= ratio_threshold)
         contamination_mask : bool array (optional)
             Mask indicating which values were contaminated
         kp_values : array (optional)
@@ -312,10 +313,28 @@ class AngularCorrection:
             kp_method=self.kp_method
         )
         
-        # Apply correction: set contaminated values to 0
+        # Apply linear scaling correction based on Selesnick's approach:
+        # - ratio <= 1.0: Full correction (set to 0)
+        # - ratio >= ratio_threshold: No correction (unchanged) 
+        # - 1.0 < ratio < ratio_threshold: Linear scaling between 0 and 1
         corrected_counts = np.asarray(electron_counts_0deg, dtype=float).copy()
         contamination_mask = np.asarray(contamination_mask, dtype=bool)
-        corrected_counts[contamination_mask] = 0.0
+        
+        # Calculate ratio: 90° / 0° (avoid division by zero)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(electron_counts_0deg > 0, 
+                           electron_counts_90deg / electron_counts_0deg, 
+                           np.inf)
+        
+        # Apply linear scaling: scaling_factor = clip((ratio - 1.0) / (ratio_threshold - 1.0), 0.0, 1.0)
+        # This gives: 0 when ratio <= 1.0, 1 when ratio >= ratio_threshold, linear in between
+        # Ensure ratio_threshold > 1.0 to avoid division by zero
+        if self.ratio_threshold <= 1.0:
+            raise ValueError(f"ratio_threshold must be > 1.0 for linear scaling. Got {self.ratio_threshold}")
+        scaling_factor = np.clip((ratio - 1.0) / (self.ratio_threshold - 1.0), 0.0, 1.0)
+        
+        # Apply scaling only to contaminated measurements
+        corrected_counts[contamination_mask] = electron_counts_0deg[contamination_mask] * scaling_factor[contamination_mask]
         
         if return_mask:
             return corrected_counts, contamination_mask, kp_values
