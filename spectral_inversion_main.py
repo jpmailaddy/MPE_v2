@@ -26,7 +26,7 @@ class POESSpectralInversion:
     
     def __init__(self, min_energy=25., max_proton_energy=10000., max_electron_energy=10000.,
                  interp_level=27, dy=0.4, dt=16.0, 
-                 optimization_tolerance=1e-4, max_optimization_iter=500):
+                 optimization_tolerance=1e-3, max_optimization_iter=500):
         """
         Initialize POES spectral inversion processor
         
@@ -45,7 +45,7 @@ class POESSpectralInversion:
         dt : float
             Integration time (seconds)
         optimization_tolerance : float
-            Tolerance for spectral optimization convergence (default: 1e-4).
+            Tolerance for spectral optimization convergence (default: 1e-3).
         max_optimization_iter : int
             Maximum iterations for spectral optimization (default: 500).
         """
@@ -160,7 +160,10 @@ class POESSpectralInversion:
             self.K_ep = None
     
     def _forward_model_counts(self, q, spectral_model, K_matrix):
-        """Compute predicted counts via forward model: lambda = K^T @ f(q, E).
+        """Compute predicted counts via forward model (IDL-equivalent).
+        
+        Uses simple matrix multiplication: lambda = K.T @ flux
+        This matches IDL: cts = Kwfp##f where Kwfp = response * deltaE / 100 * dt
         
         K_matrix shape: (n_energy, n_channels).  Returns shape (n_channels,).
         """
@@ -171,7 +174,14 @@ class POESSpectralInversion:
             return None
         if not np.all(np.isfinite(flux)):
             return None
-        return K_matrix.T.dot(flux)
+        
+        # IDL-equivalent forward model: lambda = K @ f
+        # K_matrix already encodes: response * deltaE / 100 * dt
+        # So lambda[j] = sum_i(K_matrix[i,j] * flux[i])
+        # Use transpose for matrix multiplication: (n_channels, n_energy) @ (n_energy,) -> (n_channels,)
+        lambda_pred = K_matrix.T @ flux
+        
+        return lambda_pred
 
     def _penalty_poisson_gaussian(self, y_counts, lambda_pred, dy):
         """IDL-equivalent per-channel penalty (Poisson or Gaussian).
@@ -287,7 +297,10 @@ class POESSpectralInversion:
                 return 1e10
             if not np.all(np.isfinite(flux)):
                 return 1e10
-            lambda_pred = K.T.dot(flux)
+            
+            # IDL-equivalent forward model: lambda = K.T @ flux
+            # K already encodes: response * deltaE / 100 * dt
+            lambda_pred = K.T @ flux
         else:
             # Fallback
             spec_func = self.spec_functions_electron[spectral_model]
@@ -327,13 +340,21 @@ class POESSpectralInversion:
         # IDL: y = protoncount[0:4,i]*dt  — convert count rates to counts
         y_counts = np.asarray(proton_counts, dtype=float) * self.dt
 
-        # --- Fast-path: if all counts are effectively zero, return sentinel results
-        # (mirrors IDL where amoeba returns scalar 1 and Q is set to -1e31)
-        _NOISE_FLOOR = 0.125  # counts/sec, matching IDL noise floor
-        if np.all(np.asarray(proton_counts, dtype=float) <= _NOISE_FLOOR):
-            sentinel = {'q0': np.array([0., 0.]), 'q': np.array([0., 0.]),
+        # --- Fast-path: if all channels have essentially no detected counts, return
+        # sentinel results (mirrors IDL where amoeba returns scalar 1 and Q is set to -1e31).
+        # Expressed in raw counts (y_counts = rate*dt), not rate, so the floor means the
+        # same thing regardless of integration time. 2 counts matches the original IDL
+        # noise floor of 0.125 counts/sec at dt=16s (0.125*16=2); using <= (not <) also
+        # catches inputs sitting exactly on the floor, which previously fell through to
+        # the optimizer.
+        _NOISE_FLOOR_COUNTS = 2.0
+        if np.all(y_counts <= _NOISE_FLOOR_COUNTS):
+            # For counts below noise floor, return a very small flux
+            # Use q values that produce ~0 flux: exp(-50) ensures negligible values
+            sentinel_q = np.array([-50., 0.])
+            sentinel = {'q0': sentinel_q, 'q': sentinel_q,
                         'ell': 1e10, 'converged': False}
-            sentinel4 = {'q0': np.zeros(4), 'q': np.zeros(4),
+            sentinel4 = {'q0': np.array([-50., 0., -50., 0.]), 'q': np.array([-50., 0., -50., 0.]),
                          'ell': 1e10, 'converged': False}
             return {'relmaxwell': sentinel.copy(), 'powerlaw': sentinel.copy(),
                     'exponential': sentinel.copy(), 'drelmaxwell': sentinel4}
@@ -406,10 +427,15 @@ class POESSpectralInversion:
         y_counts = np.asarray(electron_counts_corrected, dtype=float) * self.dt
 
         # --- Fast-path: if all corrected counts are zero, skip optimization
+        # Use q values that produce ~0 flux (exp(-50) is negligible), mirroring the
+        # proton noise-floor sentinel. q=[0,0] previously left RelMaxwell/DblRelMaxwell
+        # unsuppressed (exp(0)=1) and PowerLaw/Exponential flat at 1, producing a large,
+        # identical, spuriously energy-increasing spectrum for every all-zero observation.
         if np.all(np.asarray(electron_counts_corrected, dtype=float) == 0.0):
-            sentinel = {'q0': np.array([0., 0.]), 'q': np.array([0., 0.]),
+            sentinel_q = np.array([-50., 0.])
+            sentinel = {'q0': sentinel_q, 'q': sentinel_q,
                         'ell': 1e10, 'converged': False}
-            sentinel4 = {'q0': np.zeros(4), 'q': np.zeros(4),
+            sentinel4 = {'q0': np.array([-50., 0., -50., 0.]), 'q': np.array([-50., 0., -50., 0.]),
                          'ell': 1e10, 'converged': False}
             return {'relmaxwell': sentinel.copy(), 'powerlaw': sentinel.copy(),
                     'exponential': sentinel.copy(), 'drelmaxwell': sentinel4}
@@ -490,8 +516,9 @@ class POESSpectralInversion:
         if self.K_ep is not None:
             # proton_flux expected shape (n_energy,)
             # p_lambda = K_ep.T @ proton_flux  -> expected counts per electron channel (counts)
+            # Use IDL-equivalent matrix multiplication (K_ep already encodes deltaE and dt)
             try:
-                p_lambda = self.K_ep.T.dot(proton_flux)
+                p_lambda = self.K_ep.T @ proton_flux
             except Exception:
                 # Dimension mismatch fallback: interpolate or raise
                 raise RuntimeError('Dimension mismatch between K_ep and proton_flux in remove_proton_contamination')
@@ -721,25 +748,52 @@ def _find_response_csv(telescope, response_type):
                 candidates.append(os.path.join(cwd, fn))
     if not candidates:
         raise FileNotFoundError(f"No response CSV found for {telescope}/{response_type} in {cwd}")
-    # Prefer file with the most columns (most complete response). Load and inspect each candidate.
-    best = None
-    best_cols = -1
-    for c in candidates:
-        try:
-            data = np.loadtxt(c, delimiter=',')
-            # ensure 2D
-            if data.ndim == 1:
-                cols = max(0, data.size - 1)
-            else:
-                cols = data.shape[1] - 1
-        except Exception:
-            cols = -1
-        if cols > best_cols:
-            best_cols = cols
-            best = c
-    if best is None:
-        raise FileNotFoundError(f"No usable response CSV found for {telescope}/{response_type} in {cwd}")
-    return best
+    
+    # Prefer files with _v2 suffix first (as documented), then fall back to most columns
+    v2_candidates = [c for c in candidates if '_v2' in os.path.basename(c)]
+    non_v2_candidates = [c for c in candidates if '_v2' not in os.path.basename(c)]
+    
+    if v2_candidates:
+        # If we have _v2 files, prefer the one with the most columns among them
+        best = None
+        best_cols = -1
+        for c in v2_candidates:
+            try:
+                data = np.loadtxt(c, delimiter=',')
+                # ensure 2D
+                if data.ndim == 1:
+                    cols = max(0, data.size - 1)
+                else:
+                    cols = data.shape[1] - 1
+            except Exception:
+                cols = -1
+            if cols > best_cols:
+                best_cols = cols
+                best = c
+        if best is not None:
+            return best
+    
+    # Fall back to non-_v2 files if no _v2 files found or they were not usable
+    if non_v2_candidates:
+        best = None
+        best_cols = -1
+        for c in non_v2_candidates:
+            try:
+                data = np.loadtxt(c, delimiter=',')
+                # ensure 2D
+                if data.ndim == 1:
+                    cols = max(0, data.size - 1)
+                else:
+                    cols = data.shape[1] - 1
+            except Exception:
+                cols = -1
+            if cols > best_cols:
+                best_cols = cols
+                best = c
+        if best is not None:
+            return best
+    
+    raise FileNotFoundError(f"No usable response CSV found for {telescope}/{response_type} in {cwd}")
 
 
 def read_response_csv(telescope, response_type, min_energy, max_proton_energy, interp_level):
@@ -848,9 +902,9 @@ def _apply_electron_quality_checks(new_electron_count):
 def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
                      satellite='m01', output_file=None, p6_scale=1.0,
                      electron_counts_90deg=None, apply_angular_correction=False,
-                     latitude=None, time_array=None, 
-                     n_workers=1, use_caching=False, 
-                     optimization_tolerance=1e-4, max_optimization_iter=500):
+                     latitude=None, time_array=None,
+                     n_workers=1, use_caching=False, dt=16.0,
+                     optimization_tolerance=1e-3, max_optimization_iter=500):
     """Main processing function for POES data.
 
     Processing pipeline matches IDL ``spectral_fits_00.pro``:
@@ -897,8 +951,15 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         Number of parallel workers for processing (1 = sequential, >1 = parallel).
     use_caching : bool
         Enable caching of spectral fits for similar count patterns.
+    dt : float
+        Integration time (seconds) matching the resolution of ``proton_counts``/
+        ``electron_counts`` (e.g. 2.0 for 2-second data, 16.0 for 16-second
+        data). This MUST match the actual cadence of the input arrays: it
+        converts count rates to counts for the Poisson/Gaussian fit
+        likelihood, so a mismatched value silently distorts every spectral
+        fit (default: 16.0).
     optimization_tolerance : float
-        Tolerance for spectral optimization convergence (default: 1e-4).
+        Tolerance for spectral optimization convergence (default: 1e-3).
     max_optimization_iter : int
         Maximum iterations for spectral optimization (default: 500).
 
@@ -910,6 +971,7 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
 
     # Initialize processor
     processor = POESSpectralInversion(
+        dt=dt,
         optimization_tolerance=optimization_tolerance,
         max_optimization_iter=max_optimization_iter
     )
@@ -923,7 +985,7 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         print(f"  Using {n_workers} parallel workers", flush=True)
     if use_caching:
         print(f"  Using spectral fit caching", flush=True)
-    if optimization_tolerance != 1e-4 or max_optimization_iter != 500:
+    if optimization_tolerance != 1e-3 or max_optimization_iter != 500:
         print(f"  Optimization: tol={optimization_tolerance}, max_iter={max_optimization_iter}", flush=True)
     
     # Start timing
@@ -1037,6 +1099,7 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
     electron_fluxes            = np.zeros((len(processor.energy), n_time))
     proton_contamination       = np.zeros((3, n_time))   # E1-E3 contamination rates
     corrected_electron_counts  = np.zeros((4, n_time))   # [E1, E2, E3, E4] count rates
+    e4_correction_flag         = np.zeros(n_time, dtype=np.int8)   # Flag for E4=E3 correction
     proton_model_weights       = np.zeros((4, n_time))   # [wRM, wPL, wEE, wDM]
     electron_model_weights     = np.zeros((4, n_time))
 
@@ -1047,7 +1110,7 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
     kp_values_all = None
     if apply_angular_correction and electron_counts_90deg is not None and latitude is not None and time_array is not None:
         try:
-            from angular_corrections import load_kp_data, get_kp_at_time
+            from angular_corrections import load_kp_data, get_kp_at_time, DEFAULT_RATIO_THRESHOLD
             
             # Pre-load Kp data ONCE (this was being loaded for EACH time step before!)
             kp_data_angular = load_kp_data()
@@ -1079,7 +1142,8 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         # ---- Step 2: Predicted P1-P6 counts from proton flux ----
         # IDL: lambda = simpleForwardModel(Kwfp, combined_flux, dt, energy)
         #           = K_proton^T @ p_flux   (K_proton already has dt folded in)
-        p_lambda = K_proton.T.dot(p_flux)   # shape (6,)
+        # Use IDL-equivalent matrix multiplication (K_proton already encodes deltaE and dt)
+        p_lambda = K_proton.T @ p_flux   # shape (6,)
 
         # ---- Step 3: Proton contamination removal from E1-E3 ----
         # IDL: pContam = K3 ## protonFluxes[*,i]
@@ -1111,14 +1175,21 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
                     ratio = e_counts_90deg_sum / e_counts_0deg_sum
                 else:
                     ratio = np.inf
-                is_suspicious_ratio = ratio <= 2.0
+                is_suspicious_ratio = ratio <= DEFAULT_RATIO_THRESHOLD
                 
                 # Combined mask: contaminated measurements
                 contamination_mask = is_low_activity and is_high_latitude and is_suspicious_ratio
                 
-                # Apply correction: if contaminated, set all E1-E3 to 0
+                # Apply linear scaling correction based on Selesnick's approach:
+                # - ratio <= 1.0: Full correction (set to 0)
+                # - ratio >= DEFAULT_RATIO_THRESHOLD: No correction (unchanged)
+                # - 1.0 < ratio < DEFAULT_RATIO_THRESHOLD: Linear scaling between 0 and 1
                 if contamination_mask and e_counts_0deg_sum > 0:
-                    e_counts_corrected = np.zeros_like(e_counts_corrected)
+                    # Apply linear scaling: scaling_factor = clip((ratio - 1.0) / (DEFAULT_RATIO_THRESHOLD - 1.0), 0.0, 1.0)
+                    if DEFAULT_RATIO_THRESHOLD <= 1.0:
+                        raise ValueError(f"DEFAULT_RATIO_THRESHOLD must be > 1.0 for linear scaling. Got {DEFAULT_RATIO_THRESHOLD}")
+                    scaling_factor = np.clip((ratio - 1.0) / (DEFAULT_RATIO_THRESHOLD - 1.0), 0.0, 1.0)
+                    e_counts_corrected *= scaling_factor
                     
             except Exception as e:
                 print(f"Warning: Failed to apply angular correction at time step {t}: {e}")
@@ -1135,6 +1206,14 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
             e4_virtual = 0.0
 
         e_counts_4ch = np.append(e_counts_corrected, e4_virtual)   # [E1,E2,E3,E4]
+
+        # ---- Step 4.5: Check for E4 > E3 and apply correction ----
+        # If E4 > E3, set E4 = E3 to prevent unphysical spectra
+        if e_counts_4ch[3] > e_counts_4ch[2]:  # E4 > E3
+            e_counts_4ch[3] = e_counts_4ch[2]  # Set E4 = E3
+            e4_correction_flag[t] = 1       # Flag this correction
+        else:
+            e4_correction_flag[t] = 0       # No correction needed
 
         # ---- Step 5: IDL quality checks on corrected electron channels ----
         e_counts_4ch = _apply_electron_quality_checks(e_counts_4ch)
@@ -1172,6 +1251,7 @@ def process_poes_data(proton_counts, electron_counts, date_str='2019-09-06',
         'electron_flux':              electron_fluxes,
         'proton_contamination':       proton_contamination,
         'corrected_electron_counts':  corrected_electron_counts,
+        'e4_correction_flag':         e4_correction_flag,
         'proton_model_weights':       proton_model_weights,
         'electron_model_weights':     electron_model_weights,
         'date':                       date_str,
